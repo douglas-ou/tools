@@ -172,7 +172,7 @@
     padding: 12px 24px; background: var(--surface);
     border-bottom: 1px solid var(--border); overflow-x: auto;
   }
-  .timeline-canvas { height: 50px; position: relative; min-width: 100%; }
+  .timeline-canvas { height: 50px; position: relative; min-width: 100%; padding: 0 8px; }
   .tl-dot {
     position: absolute; width: 6px; height: 6px; border-radius: 50%;
     top: 50%; transform: translateY(-50%); cursor: pointer; transition: transform 0.15s;
@@ -1094,7 +1094,7 @@ function renderTimelineViz() {
   container.innerHTML = '';
   for (let i = 0; i < meaningful.length; i += step) {
     const r = meaningful[i];
-    const pct = ((new Date(r.timestamp).getTime() - first) / range * 100).toFixed(3);
+    const pct = (2 + (new Date(r.timestamp).getTime() - first) / range * 96).toFixed(3);
     const cls = r.type === 'progress' ? 'type-progress' : 'type-' + r.type;
     const dot = document.createElement('div');
     dot.className = 'tl-dot ' + cls;
