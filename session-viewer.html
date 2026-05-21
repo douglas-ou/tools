@@ -901,7 +901,19 @@ function extractInfo(rec) {
     data: rec.data || null,
   };
   const msg = rec.message;
-  if (!msg) return info;
+  if (!msg) {
+    // Handle records without message field (system, file-history-snapshot, etc.)
+    if (rec.content) {
+      info.textContent = rec.content;
+      info.preview = rec.content.slice(0, 120).replace(/\n/g, ' ');
+    }
+    if (rec.subtype) info.preview = rec.subtype + (info.preview ? ': ' + info.preview : '');
+    if (rec.hookInfos) {
+      info.preview = rec.hookInfos.length + ' hooks ran';
+      info.data = { hookInfos: rec.hookInfos, hookErrors: rec.hookErrors, hookCount: rec.hookCount };
+    }
+    return info;
+  }
   info.role = msg.role || '';
   info.model = msg.model || '';
   info.stopReason = msg.stop_reason || '';
@@ -1073,7 +1085,7 @@ function renderStats() {
 
 function renderTimelineViz() {
   const container = document.getElementById('timelineViz');
-  const meaningful = allRecords.filter(r => r.type !== 'progress' || showProgress);
+  const meaningful = allRecords.filter(r => (r.type !== 'progress' || showProgress) && r.type !== 'file-history-snapshot');
   if (!meaningful.length) { container.innerHTML = ''; return; }
   const first = new Date(meaningful[0].timestamp).getTime();
   const last = new Date(meaningful[meaningful.length - 1].timestamp).getTime();
@@ -1296,6 +1308,7 @@ function filterAndRender() {
   if (!showProgress) {
     filteredRecords = filteredRecords.filter(r => r.info.type !== 'progress');
   }
+  filteredRecords = filteredRecords.filter(r => r.info.type !== 'file-history-snapshot');
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
     filteredRecords = filteredRecords.filter(r =>
