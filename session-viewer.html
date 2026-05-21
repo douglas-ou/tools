@@ -350,6 +350,50 @@
   }
   .sidebar-toggle:hover { color: var(--text); border-color: var(--text2); }
   .chooser-empty { padding: 40px 20px; text-align: center; color: var(--text2); font-size: 13px; }
+  /* Subagent nesting */
+  .file-item-main { position: relative; }
+  .file-item-main .toggle-arrow {
+    font-size: 10px; color: var(--text2); transition: transform 0.15s;
+    width: 14px; flex-shrink: 0; display: inline-block;
+  }
+  .file-item-main.expanded .toggle-arrow { transform: rotate(90deg); }
+  .subagent-children {
+    display: none; border-left: 2px solid #e0d6f0; margin-left: 36px;
+  }
+  .subagent-children.visible { display: block; }
+  .file-item-sub {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 24px 6px 16px; cursor: pointer; transition: background 0.1s;
+    font-size: 12px;
+  }
+  .file-item-sub:hover { background: var(--surface2); }
+  .fi-agent-type {
+    font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px;
+    background: #f6f1ff; color: var(--purple); flex-shrink: 0;
+    text-transform: capitalize;
+  }
+  .fi-agent-desc {
+    flex: 1; font-size: 12px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .file-item-sub .fi-date {
+    font-size: 10px; color: var(--text2); min-width: 120px; flex-shrink: 0;
+  }
+  .file-item-sub .fi-size {
+    font-size: 10px; color: var(--text2); min-width: 40px;
+    text-align: right; flex-shrink: 0;
+  }
+  .fi-child-count {
+    font-size: 10px; background: #e8ddf5; color: var(--purple);
+    padding: 1px 6px; border-radius: 10px; flex-shrink: 0;
+  }
+  .view-agent-btn {
+    display: inline-block; background: var(--purple); color: #fff;
+    padding: 4px 10px; border-radius: 4px; font-size: 11px;
+    font-weight: 600; cursor: pointer; margin-top: 6px; border: none;
+  }
+  .view-agent-btn:hover { opacity: 0.85; }
+  .agent-meta { font-size: 11px; color: var(--text2); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -432,6 +476,7 @@ let searchQuery = '';
 let serverMode = false;
 let cachedFileList = [];
 let currentFilePath = '';
+let agentResultMap = new Map();
 
 // Sanitize: escape HTML special chars to prevent XSS
 const _esc = document.createElement('div');
@@ -504,6 +549,13 @@ function fmtSize(bytes) {
   return (bytes / 1048576).toFixed(1) + 'M';
 }
 
+function getSubagentPath(agentId) {
+  const sessionDir = currentFilePath.includes('/subagents/')
+    ? currentFilePath.split('/subagents/')[0]
+    : currentFilePath.replace('.jsonl', '');
+  return sessionDir + '/subagents/agent-' + agentId + '.jsonl';
+}
+
 function fmtRelative(ts) {
   const diff = (Date.now() / 1000) - ts;
   if (diff < 60) return 'just now';
@@ -524,50 +576,168 @@ function renderFileList(files) {
     list.innerHTML = '<div class="chooser-empty">No matching files found</div>';
     return;
   }
-  // Group by project, preserving sort order (already by mtime desc)
+
+  // Build parent-child map
+  const parentMap = new Map();
+  const mainFiles = [];
+  const allMainUuids = new Set();
+  for (const f of files) {
+    if (f.parent_uuid) {
+      if (!parentMap.has(f.parent_uuid)) parentMap.set(f.parent_uuid, []);
+      parentMap.get(f.parent_uuid).push(f);
+    } else {
+      mainFiles.push(f);
+      allMainUuids.add(f.uuid);
+    }
+  }
+
+  // Find orphaned subagents (parent not in current list)
+  const orphans = [];
+  for (const [pUuid, children] of parentMap) {
+    if (!allMainUuids.has(pUuid)) orphans.push(...children);
+  }
+
+  // Group main sessions by project
   const groups = {};
   const groupOrder = [];
-  for (const f of files) {
+  for (const f of mainFiles) {
     const proj = f.project || 'unknown';
     if (!groups[proj]) { groups[proj] = []; groupOrder.push(proj); }
     groups[proj].push(f);
   }
+
   const frag = document.createDocumentFragment();
   for (const proj of groupOrder) {
     const items = groups[proj];
     const group = document.createElement('div');
     group.className = 'project-group';
+    const totalCount = items.reduce((s, f) => s + 1 + (parentMap.get(f.uuid)?.length || 0), 0);
     const header = document.createElement('div');
     header.className = 'project-header';
-    header.innerHTML = '<span>' + esc(proj) + '</span><span class="count">' + items.length + '</span>';
+    header.innerHTML = '<span>' + esc(proj) + '</span><span class="count">' + totalCount + '</span>';
     group.appendChild(header);
+
     for (const f of items) {
-      const item = document.createElement('div');
-      item.className = 'file-item';
+      const children = parentMap.get(f.uuid) || [];
       const shortUuid = f.uuid.length > 8 ? f.uuid.slice(0, 8) : f.uuid;
-      const isSub = f.path.includes('/subagents/');
       const title = f.title || '';
       const dateStr = fmtDateAbsolute(f.mtime);
-      item.innerHTML =
-        '<span class="fi-date">' + esc(dateStr) + '</span>' +
-        '<span class="fi-title">' + (title ? esc(title) : '<span style="color:var(--text2)">' + esc(shortUuid) + '</span>') + '</span>' +
-        (isSub ? '<span class="fi-sub">subagent</span>' : '') +
-        '<span class="fi-size">' + fmtSize(f.size) + '</span>';
-      item.title = shortUuid + (title ? '\n' + title : '') + '\n' + dateStr;
-      item.addEventListener('click', () => loadFromServer(f.path));
-      group.appendChild(item);
+
+      const item = document.createElement('div');
+      if (children.length) {
+        item.className = 'file-item file-item-main';
+        item.dataset.sessionUuid = f.uuid;
+        item.dataset.path = f.path;
+        item.innerHTML =
+          '<span class="toggle-arrow">\u25B6</span>' +
+          '<span class="fi-date">' + esc(dateStr) + '</span>' +
+          '<span class="fi-title">' + (title ? esc(title) : '<span style="color:var(--text2)">' + esc(shortUuid) + '</span>') + '</span>' +
+          '<span class="fi-child-count">' + children.length + ' sub</span>' +
+          '<span class="fi-size">' + fmtSize(f.size) + '</span>';
+
+        const childContainer = document.createElement('div');
+        childContainer.className = 'subagent-children';
+        childContainer.dataset.parent = f.uuid;
+        for (const c of children) {
+          const meta = c.agent_meta || {};
+          const agentType = meta.agentType || 'subagent';
+          const desc = meta.description || c.title || c.uuid.slice(0, 8);
+          const childDate = fmtDateAbsolute(c.mtime);
+          const subItem = document.createElement('div');
+          subItem.className = 'file-item-sub';
+          subItem.dataset.path = c.path;
+          subItem.innerHTML =
+            '<span class="fi-agent-type">' + esc(agentType) + '</span>' +
+            '<span class="fi-date">' + esc(childDate) + '</span>' +
+            '<span class="fi-agent-desc">' + esc(desc) + '</span>' +
+            '<span class="fi-size">' + fmtSize(c.size) + '</span>';
+          subItem.title = agentType + ': ' + desc;
+          childContainer.appendChild(subItem);
+        }
+        group.appendChild(item);
+        group.appendChild(childContainer);
+      } else {
+        item.className = 'file-item';
+        item.dataset.path = f.path;
+        item.innerHTML =
+          '<span class="fi-date">' + esc(dateStr) + '</span>' +
+          '<span class="fi-title">' + (title ? esc(title) : '<span style="color:var(--text2)">' + esc(shortUuid) + '</span>') + '</span>' +
+          '<span class="fi-size">' + fmtSize(f.size) + '</span>';
+        item.title = shortUuid + (title ? '\n' + title : '') + '\n' + dateStr;
+        group.appendChild(item);
+      }
     }
     frag.appendChild(group);
   }
+
+  // Orphaned subagents group
+  if (orphans.length) {
+    const group = document.createElement('div');
+    group.className = 'project-group';
+    const header = document.createElement('div');
+    header.className = 'project-header';
+    header.innerHTML = '<span>(orphaned subagents)</span><span class="count">' + orphans.length + '</span>';
+    group.appendChild(header);
+    for (const c of orphans) {
+      const meta = c.agent_meta || {};
+      const agentType = meta.agentType || 'subagent';
+      const desc = meta.description || c.title || c.uuid.slice(0, 8);
+      const subItem = document.createElement('div');
+      subItem.className = 'file-item-sub';
+      subItem.dataset.path = c.path;
+      subItem.innerHTML =
+        '<span class="fi-agent-type">' + esc(agentType) + '</span>' +
+        '<span class="fi-date">' + esc(fmtDateAbsolute(c.mtime)) + '</span>' +
+        '<span class="fi-agent-desc">' + esc(desc) + '</span>' +
+        '<span class="fi-size">' + fmtSize(c.size) + '</span>';
+      subItem.title = agentType + ': ' + desc + '\n' + (c.project || '');
+      group.appendChild(subItem);
+    }
+    frag.appendChild(group);
+  }
+
   list.appendChild(frag);
-  document.getElementById('chooserStatus').textContent = files.length + ' sessions';
+
+  // Event delegation for clicks
+  list.onclick = function(e) {
+    const mainItem = e.target.closest('.file-item-main');
+    if (mainItem) {
+      // Click on toggle arrow → expand/collapse subagents
+      // Click anywhere else → load the session
+      if (e.target.closest('.toggle-arrow')) {
+        mainItem.classList.toggle('expanded');
+        const children = list.querySelector('.subagent-children[data-parent="' + mainItem.dataset.sessionUuid + '"]');
+        if (children) children.classList.toggle('visible');
+        return;
+      }
+      loadFromServer(mainItem.dataset.path);
+      return;
+    }
+    const subItem = e.target.closest('.file-item-sub');
+    if (subItem && subItem.dataset.path) {
+      loadFromServer(subItem.dataset.path);
+      return;
+    }
+    const fileItem = e.target.closest('.file-item');
+    if (fileItem && fileItem.dataset.path) {
+      loadFromServer(fileItem.dataset.path);
+    }
+  };
+
+  const subCount = Array.from(parentMap.values()).reduce((s, c) => s + c.length, 0);
+  document.getElementById('chooserStatus').textContent =
+    mainFiles.length + ' sessions' + (subCount ? ' (' + subCount + ' subagents)' : '');
 }
 
 function renderSidebarList(files) {
   const list = document.getElementById('sidebarList');
-  list.innerHTML = '';
+  list.textContent = '';
   if (!files.length) {
-    list.innerHTML = '<div class="chooser-empty">No sessions found</div>';
+    const emptyDiv = document.createElement('div');
+    emptyDiv.className = 'chooser-empty';
+    emptyDiv.textContent = 'No sessions found';
+    list.textContent = '';
+    list.appendChild(emptyDiv);
     return;
   }
   const groups = {};
@@ -758,8 +928,14 @@ function extractInfo(rec) {
         info.toolInput = block.input || {};
         info.contentType = 'tool_use';
         if (!info.preview) {
-          const s = JSON.stringify(block.input, null, 2);
-          info.preview = 'Tool: ' + block.name + ' \u2014 ' + s.slice(0, 80);
+          if (block.name === 'Agent' && block.input) {
+            const t = block.input.subagent_type || 'Agent';
+            const d = block.input.description || '';
+            info.preview = '[' + t + '] ' + d.slice(0, 80);
+          } else {
+            const s = JSON.stringify(block.input, null, 2);
+            info.preview = 'Tool: ' + block.name + ' \u2014 ' + s.slice(0, 80);
+          }
         }
       }
       if (block.type === 'tool_result') {
@@ -999,20 +1175,84 @@ function buildCard(info, idx) {
   if (info.toolInput) {
     const block = document.createElement('div');
     block.className = 'content-block';
-    const tb = document.createElement('div');
-    tb.className = 'tool-block';
-    const th = document.createElement('div');
-    th.className = 'tool-header';
-    const tn = document.createElement('span');
-    tn.className = 'tool-name';
-    tn.textContent = info.toolName;
-    th.appendChild(tn);
-    tb.appendChild(th);
-    const ti = document.createElement('div');
-    ti.className = 'tool-input';
-    ti.textContent = JSON.stringify(info.toolInput, null, 2);
-    tb.appendChild(ti);
-    block.appendChild(tb);
+
+    if (info.toolName === 'Agent') {
+      // Enhanced Agent tool display
+      const tb = document.createElement('div');
+      tb.className = 'tool-block';
+      const th = document.createElement('div');
+      th.className = 'tool-header';
+      const tn = document.createElement('span');
+      tn.className = 'tool-name';
+      tn.textContent = info.toolInput.subagent_type || 'Agent';
+      th.appendChild(tn);
+      if (info.toolInput.description) {
+        const desc = document.createElement('span');
+        desc.style.cssText = 'color:var(--text);font-weight:400;margin-left:8px;font-size:12px';
+        desc.textContent = info.toolInput.description;
+        th.appendChild(desc);
+      }
+      tb.appendChild(th);
+      if (info.toolInput.prompt) {
+        const ti = document.createElement('div');
+        ti.className = 'tool-input';
+        ti.textContent = info.toolInput.prompt;
+        tb.appendChild(ti);
+      }
+      block.appendChild(tb);
+
+      // Add "View Session" button if agentId is available
+      const rec = allRecords[idx];
+      const agentInfo = agentResultMap.get(rec?.uuid);
+      if (agentInfo?.agentId) {
+        const btn = document.createElement('button');
+        btn.className = 'view-agent-btn';
+        btn.textContent = 'View Session \u2192';
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
+          loadFromServer(getSubagentPath(agentInfo.agentId));
+        });
+        block.appendChild(btn);
+      }
+    } else {
+      // Standard tool display
+      const tb = document.createElement('div');
+      tb.className = 'tool-block';
+      const th = document.createElement('div');
+      th.className = 'tool-header';
+      const tn = document.createElement('span');
+      tn.className = 'tool-name';
+      tn.textContent = info.toolName;
+      th.appendChild(tn);
+      tb.appendChild(th);
+      const ti = document.createElement('div');
+      ti.className = 'tool-input';
+      ti.textContent = JSON.stringify(info.toolInput, null, 2);
+      tb.appendChild(ti);
+      block.appendChild(tb);
+    }
+    body.appendChild(block);
+  }
+
+  // Agent tool_result — add "View Subagent Session" button
+  if (allRecords[idx]?.toolUseResult?.agentId) {
+    const tr = allRecords[idx].toolUseResult;
+    const block = document.createElement('div');
+    block.className = 'content-block';
+    const meta = document.createElement('div');
+    meta.className = 'agent-meta';
+    const dur = tr.totalDurationMs ? (tr.totalDurationMs / 1000).toFixed(1) + 's' : '';
+    const tok = tr.totalTokens ? fmtSize(tr.totalTokens * 4) : '';
+    meta.textContent = 'Completed: ' + [tr.totalToolUseCount + ' tool calls', tok, dur].filter(Boolean).join(', ');
+    block.appendChild(meta);
+    const btn = document.createElement('button');
+    btn.className = 'view-agent-btn';
+    btn.textContent = 'View Subagent Session \u2192';
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      loadFromServer(getSubagentPath(tr.agentId));
+    });
+    block.appendChild(btn);
     body.appendChild(block);
   }
 
@@ -1065,6 +1305,14 @@ function filterAndRender() {
       (r.info.thinking && r.info.thinking.toLowerCase().includes(q)) ||
       (r.info.preview && r.info.preview.toLowerCase().includes(q))
     );
+  }
+
+  // Build agent result map: assistant record uuid → toolUseResult
+  agentResultMap = new Map();
+  for (const r of allRecords) {
+    if (r.toolUseResult?.agentId) {
+      agentResultMap.set(r.sourceToolAssistantUUID, r.toolUseResult);
+    }
   }
 
   const container = document.getElementById('timeline');

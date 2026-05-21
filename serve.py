@@ -82,6 +82,18 @@ def collect_jsonl_files():
                 continue
             title = extract_title(full_path)
             mtime_iso = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            # Extract parent session UUID and agent metadata for subagents
+            parent_uuid = None
+            agent_meta = None
+            if '/subagents/' in rel_path:
+                parent_uuid = rel_path.split('/subagents/')[0].split('/')[-1]
+                meta_path = full_path.rsplit('.jsonl', 1)[0] + '.meta.json'
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, 'r', encoding='utf-8') as mf:
+                            agent_meta = json.load(mf)
+                    except (json.JSONDecodeError, OSError):
+                        pass
             files.append({
                 "path": rel_path,
                 "project": project,
@@ -90,6 +102,8 @@ def collect_jsonl_files():
                 "mtime": st.st_mtime,
                 "mtime_iso": mtime_iso,
                 "uuid": fname[:-6],  # strip .jsonl
+                "parent_uuid": parent_uuid,
+                "agent_meta": agent_meta,
             })
     return files
 
