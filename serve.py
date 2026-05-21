@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Minimal HTTP server for Session Viewer.
+
+Serves session-viewer.html and provides API to browse JSONL files
+from ~/.claude/projects/.
+
+Usage: python3 serve.py
+"""
+
+import os
+import json
+import time
+from datetime import datetime, timezone
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+HTML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session-viewer.html")
+PORT = 8124
+
+
+def decode_project_name(dir_name):
+    """Convert '-Users-oudouglas-project-tools' to 'project/tools'."""
+    parts = dir_name.lstrip("-").split("-")
+    # Skip /Users/oudouglas prefix (first 2 parts)
+    return "/".join(parts[2:]) if len(parts) > 2 else dir_name
+
+
+def extract_title(full_path):
+    """Read the first user message from a JSONL file to use as a title."""
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict) or msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                            text = block["text"]
+                            break
+                if text:
+                    # Strip XML/HTML tags and clean up
+                    import re
+                    text = re.sub(r'<[^>]+>', '', text).strip()
+                    return text[:120].replace("\n", " ").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def collect_jsonl_files():
+    """Walk ~/.claude/projects/ and collect all .jsonl files with metadata."""
+    files = []
+    if not os.path.isdir(PROJECTS_DIR):
+        return files
+    for dirpath, dirnames, filenames in os.walk(PROJECTS_DIR):
+        for fname in filenames:
+            if not fname.endswith(".jsonl"):
+                continue
+            full_path = os.path.join(dirpath, fname)
+            rel_path = os.path.relpath(full_path, PROJECTS_DIR)
+            parent_dir = rel_path.split("/")[0] if "/" in rel_path else ""
+            project = decode_project_name(parent_dir) if parent_dir else ""
+            try:
+                st = os.stat(full_path)
+            except OSError:
+                continue
+            title = extract_title(full_path)
+            mtime_iso = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            files.append({
+                "path": rel_path,
+                "project": project,
+                "title": title,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "mtime_iso": mtime_iso,
+                "uuid": fname[:-6],  # strip .jsonl
+            })
+    return files
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress default logging
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+
+        if path == "/" or path == "/session-viewer.html":
+            self._serve_html()
+        elif path == "/api/files":
+            self._serve_file_list(params)
+        elif path == "/file":
+            self._serve_jsonl(params)
+        else:
+            self.send_error(404)
+
+    def _serve_html(self):
+        try:
+            with open(HTML_FILE, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data)
+        except FileNotFoundError:
+            self.send_error(404, "session-viewer.html not found")
+
+    def _serve_file_list(self, params):
+        files = collect_jsonl_files()
+
+        # Filter
+        q = params.get("q", [""])[0].lower()
+        if q:
+            files = [f for f in files if q in f["project"].lower() or q in f["uuid"].lower() or q in f.get("title", "").lower()]
+
+        # Sort
+        sort_key = params.get("sort", ["mtime"])[0]
+        if sort_key == "size":
+            files.sort(key=lambda f: f["size"], reverse=True)
+        elif sort_key == "project":
+            files.sort(key=lambda f: f["project"])
+        else:  # mtime default
+            files.sort(key=lambda f: f["mtime"], reverse=True)
+
+        # Limit
+        limit = min(int(params.get("limit", ["100"])[0]), 500)
+        files = files[:limit]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(files).encode())
+
+    def _serve_jsonl(self, params):
+        rel_path = params.get("path", [""])[0]
+        if not rel_path:
+            self.send_error(400, "Missing path parameter")
+            return
+
+        # Security: resolve and ensure it stays within PROJECTS_DIR
+        full_path = os.path.realpath(os.path.join(PROJECTS_DIR, rel_path))
+        projects_real = os.path.realpath(PROJECTS_DIR)
+        if not full_path.startswith(projects_real + os.sep) and full_path != projects_real:
+            self.send_error(403, "Access denied")
+            return
+        if not full_path.endswith(".jsonl"):
+            self.send_error(400, "Only .jsonl files allowed")
+            return
+        if not os.path.isfile(full_path):
+            self.send_error(404, "File not found")
+            return
+
+        try:
+            st = os.stat(full_path)
+            with open(full_path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except OSError:
+            self.send_error(500, "Error reading file")
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    url = f"http://localhost:{PORT}"
+    print(f"Session Viewer: {url}")
+    webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
