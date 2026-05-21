@@ -8,8 +8,10 @@ Usage: python3 serve.py
 """
 
 import os
+import re
 import json
 import time
+import functools
 from datetime import datetime, timezone
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -20,44 +22,106 @@ HTML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session-vi
 PORT = 8124
 
 
+@functools.lru_cache(maxsize=512)
 def decode_project_name(dir_name):
-    """Convert '-Users-oudouglas-project-tools' to 'project/tools'."""
-    parts = dir_name.lstrip("-").split("-")
-    # Skip /Users/oudouglas prefix (first 2 parts)
-    return "/".join(parts[2:]) if len(parts) > 2 else dir_name
+    """Convert encoded dir name back to a human-readable project path.
+
+    Claude encodes project paths by replacing '/' with '-'. However, real
+    hyphens in directory names (e.g. 'team-workspace') are indistinguishable
+    from path separators in the encoded string. We resolve this by greedily
+    matching against the real filesystem — combining segments with '-' until
+    an actual directory is found.
+    """
+    stripped = dir_name.lstrip("-")
+    parts = stripped.split("-")
+    if len(parts) <= 2:
+        return dir_name
+
+    # Walk from /, longest-match-first: try combining all remaining segments
+    # first, then shorten until a real directory is found.
+    current = ""
+    i = 0
+    result_parts = []
+    while i < len(parts):
+        matched = False
+        # Try longest candidate first: parts[i..end], then shorten
+        for end in range(len(parts), i, -1):
+            candidate = "-".join(parts[i:end])
+            test_path = current + "/" + candidate if current else "/" + candidate
+            if os.path.isdir(test_path):
+                result_parts.append(candidate)
+                current = test_path
+                i = end
+                matched = True
+                break
+        if not matched:
+            result_parts.append(parts[i])
+            current = current + "/" + parts[i] if current else "/" + parts[i]
+            i += 1
+
+    # Return everything after /Users/oudouglas
+    return "/".join(result_parts[2:]) if len(result_parts) > 2 else dir_name
+
+
+def _try_parse_title(lines):
+    """Try to extract a title from a list of JSONL lines. Returns title or ''."""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("type") != "user":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    text = block["text"]
+                    break
+        if text:
+            text = re.sub(r'<[^>]+>', '', text).strip()
+            return text[:120].replace("\n", " ").strip()
+    return ""
 
 
 def extract_title(full_path):
-    """Read the first user message from a JSONL file to use as a title."""
+    """Read the first user message from a JSONL file to use as title.
+
+    Uses progressive head-reading: reads in 4KB chunks up to 64KB max,
+    avoiding reading entire large files when the title is near the top.
+    """
     try:
+        chunk_size = 4096
+        max_read = 65536  # 64KB
+        tail = ""  # incomplete line from previous chunk
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if rec.get("type") != "user":
-                    continue
-                msg = rec.get("message")
-                if not isinstance(msg, dict) or msg.get("role") != "user":
-                    continue
-                content = msg.get("content")
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                            text = block["text"]
-                            break
-                if text:
-                    # Strip XML/HTML tags and clean up
-                    import re
-                    text = re.sub(r'<[^>]+>', '', text).strip()
-                    return text[:120].replace("\n", " ").strip()
+            total_read = 0
+            while total_read < max_read:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                text = tail + chunk
+                lines = text.split("\n")
+                # Last element may be incomplete — save for next iteration
+                tail = lines.pop()
+                result = _try_parse_title(lines)
+                if result:
+                    return result
+            # Process any remaining tail
+            if tail.strip():
+                result = _try_parse_title([tail])
+                if result:
+                    return result
     except OSError:
         pass
     return ""
