@@ -59,8 +59,10 @@ def decode_project_name(dir_name):
             current = current + "/" + parts[i] if current else "/" + parts[i]
             i += 1
 
-    # Return everything after /Users/oudouglas
-    return "/".join(result_parts[2:]) if len(result_parts) > 2 else dir_name
+    # Return everything after the home directory prefix
+    home_parts = os.path.expanduser("~").strip("/").split("/")
+    strip_count = len(home_parts)
+    return "/".join(result_parts[strip_count:]) if len(result_parts) > strip_count else dir_name
 
 
 def _try_parse_title(lines):
