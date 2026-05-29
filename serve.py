@@ -264,9 +264,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
     url = f"http://localhost:{PORT}"
     print(f"Session Viewer: {url}")
+    print(f"LAN access:     http://<your-lan-ip>:{PORT}")
     webbrowser.open(url)
     try:
         server.serve_forever()
